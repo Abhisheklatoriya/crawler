@@ -10,6 +10,28 @@ import streamlit as st
 
 
 # -----------------------------
+# Allowed LOBs (from your dropdown)
+# -----------------------------
+ALLOWED_LOBS = ["Wireless", "Home", "Business", "Brand", "Bank"]
+ALLOWED_LOBS_LOWER = {x.lower(): x for x in ALLOWED_LOBS}  # case-insensitive mapping
+
+UNMATCHED_DIR = "Needs_Match"
+
+
+def normalize_lob(lob_raw: str) -> str | None:
+    """
+    Returns the canonical LOB name if it matches allowed list (case-insensitive),
+    otherwise None.
+    """
+    if lob_raw is None:
+        return None
+    lob = str(lob_raw).strip()
+    if not lob:
+        return None
+    return ALLOWED_LOBS_LOWER.get(lob.lower())
+
+
+# -----------------------------
 # ID extraction (filename + URL)
 # -----------------------------
 GI_ID_RE = re.compile(r"\bGI-(\d{6,})\b", re.IGNORECASE)
@@ -29,19 +51,9 @@ def extract_id_from_text(text: str) -> str | None:
     if not nums:
         return None
 
-    # Heuristic: choose the longest number; if tie, pick the last occurrence
     best_len = max(len(n) for n in nums)
     candidates = [n for n in nums if len(n) == best_len]
     return candidates[-1] if candidates else nums[-1]
-
-
-def sanitize_folder_name(name: str) -> str:
-    """Make a safe folder name."""
-    if not name:
-        return "Unknown"
-    name = str(name).strip()
-    name = re.sub(r"[\\/:*?\"<>|]", "_", name)
-    return name or "Unknown"
 
 
 def human_bytes(n: float) -> str:
@@ -58,14 +70,12 @@ def human_bytes(n: float) -> str:
 # -----------------------------
 def read_csv_with_detected_header(uploaded_file) -> pd.DataFrame:
     """
-    Reads CSV where the "real" header row might not be row 0.
-    Detects the row containing "Web Link" (case-insensitive) and uses it as header.
+    Detects the header row by finding 'Web Link' (case-insensitive).
     """
     raw = pd.read_csv(uploaded_file, header=None, dtype=str, keep_default_na=False)
 
     header_row_idx = None
-    search_rows = min(50, len(raw))
-    for i in range(search_rows):
+    for i in range(min(50, len(raw))):
         row_vals = [str(x).strip() for x in raw.iloc[i].tolist()]
         if any(v.lower() == "web link" for v in row_vals):
             header_row_idx = i
@@ -88,27 +98,31 @@ def read_csv_with_detected_header(uploaded_file) -> pd.DataFrame:
 def build_id_to_lob_map(df: pd.DataFrame, link_col: str, lob_col: str) -> tuple[dict, dict]:
     """
     Returns:
-      - id_to_lob: {id: lob} (if duplicates, keeps the first non-empty lob)
-      - dup_ids: {id: [lob1, lob2, ...]} for diagnostics
+      - id_to_lob: {id: canonical_lob or ""} (canonicalized to ALLOWED_LOBS)
+      - dup_ids: {id: [lob_values...]} diagnostics
     """
     id_to_lob = {}
     dup_ids = defaultdict(list)
 
     for _, row in df.iterrows():
         link = str(row.get(link_col, "")).strip()
-        lob = str(row.get(lob_col, "")).strip()
+        lob_raw = row.get(lob_col, "")
 
         asset_id = extract_id_from_text(link)
         if not asset_id:
             continue
 
+        canonical_lob = normalize_lob(lob_raw)  # None if not valid
+        canonical_lob = canonical_lob or ""     # store empty if invalid/missing
+
         if asset_id in id_to_lob:
-            dup_ids[asset_id].append(lob)
-            if (not id_to_lob[asset_id]) and lob:
-                id_to_lob[asset_id] = lob
+            dup_ids[asset_id].append(canonical_lob)
+            # keep first non-empty canonical lob
+            if (not id_to_lob[asset_id]) and canonical_lob:
+                id_to_lob[asset_id] = canonical_lob
         else:
-            id_to_lob[asset_id] = lob
-            dup_ids[asset_id].append(lob)
+            id_to_lob[asset_id] = canonical_lob
+            dup_ids[asset_id].append(canonical_lob)
 
     return id_to_lob, dup_ids
 
@@ -117,21 +131,16 @@ def build_id_to_lob_map(df: pd.DataFrame, link_col: str, lob_col: str) -> tuple[
 # Zipping helpers
 # -----------------------------
 def zip_folder(folder_path: Path, zip_path: Path) -> None:
-    """Zip the contents of folder_path into zip_path."""
     if zip_path.exists():
         zip_path.unlink()
 
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for p in folder_path.rglob("*"):
             if p.is_file():
-                # store relative paths inside zip
                 zf.write(p, arcname=str(p.relative_to(folder_path)))
 
 
-def zip_matched_only(output_root: Path, zip_path: Path, unmatched_folder_name="Needs_Match") -> None:
-    """
-    Create a zip that contains ONLY matched LOB folders (excludes Needs_Match).
-    """
+def zip_matched_only(output_root: Path, zip_path: Path, unmatched_folder_name=UNMATCHED_DIR) -> None:
     if zip_path.exists():
         zip_path.unlink()
 
@@ -146,20 +155,16 @@ def zip_matched_only(output_root: Path, zip_path: Path, unmatched_folder_name="N
                     zf.write(p, arcname=str(p.relative_to(output_root)))
 
 
-def zip_per_lob(output_root: Path, zips_dir: Path, unmatched_folder_name="Needs_Match") -> list[Path]:
-    """
-    Create one zip per LOB folder (excludes Needs_Match). Returns list of zip file paths.
-    """
+def zip_per_lob(output_root: Path, zips_dir: Path, unmatched_folder_name=UNMATCHED_DIR) -> list[Path]:
     zips_dir.mkdir(parents=True, exist_ok=True)
     created = []
 
-    for lob_dir in output_root.iterdir():
-        if not lob_dir.is_dir():
-            continue
-        if lob_dir.name == unmatched_folder_name:
+    for lob in ALLOWED_LOBS:
+        lob_dir = output_root / lob
+        if not lob_dir.exists():
             continue
 
-        zip_path = zips_dir / f"{lob_dir.name}.zip"
+        zip_path = zips_dir / f"{lob}.zip"
         zip_folder(lob_dir, zip_path)
         created.append(zip_path)
 
@@ -170,20 +175,9 @@ def zip_per_lob(output_root: Path, zips_dir: Path, unmatched_folder_name="Needs_
 # Streamlit App
 # -----------------------------
 st.set_page_config(page_title="LOB Auto Organizer", layout="wide")
-st.title("LOB Auto Organizer (Upload one-by-one → auto-sort → ZIP download at end)")
+st.title("LOB Auto Organizer (LOB whitelist + ZIP download)")
 
-with st.expander("What this app does", expanded=False):
-    st.write(
-        """
-        - Upload your sheet as CSV (export from Google Sheets).
-        - App builds a mapping: Link (contains ID) → ID → LOB.
-        - Upload creative files one-by-one:
-          - Extract ID from filename
-          - Find LOB from mapping
-          - Save into output/<LOB>/<filename> (matched) OR output/Needs_Match (unmatched)
-        - When finished, generate ZIPs ready to download.
-        """
-    )
+st.caption(f"Allowed LOBs: {', '.join(ALLOWED_LOBS)}")
 
 col1, col2 = st.columns([1, 1])
 with col1:
@@ -194,7 +188,9 @@ with col2:
 output_root_path = Path(output_root)
 output_root_path.mkdir(parents=True, exist_ok=True)
 
-UNMATCHED_DIR = "Needs_Match"
+# Ensure folders exist (exactly like your dropdown)
+for lob in ALLOWED_LOBS:
+    (output_root_path / lob).mkdir(parents=True, exist_ok=True)
 (output_root_path / UNMATCHED_DIR).mkdir(parents=True, exist_ok=True)
 
 st.divider()
@@ -202,8 +198,6 @@ st.divider()
 # Session state defaults
 if "id_to_lob" not in st.session_state:
     st.session_state.id_to_lob = None
-if "dup_ids" not in st.session_state:
-    st.session_state.dup_ids = None
 if "start_time" not in st.session_state:
     st.session_state.start_time = None
 if "bytes_done" not in st.session_state:
@@ -213,50 +207,49 @@ if "files_done" not in st.session_state:
 if "log" not in st.session_state:
     st.session_state.log = []
 if "zip_paths" not in st.session_state:
-    st.session_state.zip_paths = []  # store generated zip file paths
-
+    st.session_state.zip_paths = []
 
 total_bytes = int(total_gb * 1024**3)
 
 # -----------------------------
-# Step 1: Upload CSV
+# 1) Upload CSV
 # -----------------------------
 st.subheader("1) Upload the sheet (CSV)")
 csv_file = st.file_uploader("Upload CSV", type=["csv"], key="csv_uploader")
 
 if csv_file is not None:
     df = read_csv_with_detected_header(csv_file)
-
     st.write("Preview (detected headers):")
     st.dataframe(df.head(15), use_container_width=True)
 
-    st.markdown("### Select the correct columns")
     cols = list(df.columns)
+    lower_cols = [c.lower() for c in cols]
 
     def find_col(name: str) -> int:
-        lower = [c.lower() for c in cols]
-        return lower.index(name.lower()) if name.lower() in lower else 0
+        return lower_cols.index(name.lower()) if name.lower() in lower_cols else 0
 
     link_col = st.selectbox("Column that contains the link with the ID (usually Web Link)", options=cols, index=find_col("Web Link"))
     lob_col = st.selectbox("Column that contains LOB", options=cols, index=find_col("LOB"))
 
     id_to_lob, dup_ids = build_id_to_lob_map(df, link_col, lob_col)
     st.session_state.id_to_lob = id_to_lob
-    st.session_state.dup_ids = dup_ids
 
     st.success(f"Loaded mapping for {len(id_to_lob):,} IDs.")
 
-    dup_count = sum(1 for _, v in dup_ids.items() if len(set([x for x in v if x])) > 1)
-    if dup_count:
+    invalid_lobs = 0
+    for _, v in id_to_lob.items():
+        if v == "":
+            invalid_lobs += 1
+    if invalid_lobs:
         st.warning(
-            f"Found {dup_count} IDs mapped to multiple LOB values. "
-            f"The app will keep the first non-empty LOB for each ID."
+            f"{invalid_lobs:,} rows have missing/invalid LOB (not one of {ALLOWED_LOBS}). "
+            f"Those will go to {UNMATCHED_DIR}."
         )
 
 st.divider()
 
 # -----------------------------
-# Step 2: Upload files one-by-one
+# 2) Upload files one-by-one
 # -----------------------------
 st.subheader("2) Upload files one-by-one (auto-sorts into LOB folders)")
 
@@ -299,46 +292,41 @@ if uploaded is not None:
         st.error(f"Could not extract an ID from filename: {filename}")
         st.session_state.log.append({"filename": filename, "asset_id": None, "lob": None, "status": "NO_ID_IN_FILENAME", "bytes": file_size})
     else:
-        lob_raw = st.session_state.id_to_lob.get(asset_id, "")
-        lob_folder = sanitize_folder_name(lob_raw) if lob_raw else UNMATCHED_DIR
+        lob = st.session_state.id_to_lob.get(asset_id, "")
+        dest_folder = lob if lob in ALLOWED_LOBS else UNMATCHED_DIR
 
-        dest_dir = output_root_path / lob_folder
-        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_dir = output_root_path / dest_folder
         dest_path = dest_dir / filename
 
         with open(dest_path, "wb") as f:
             f.write(uploaded.getbuffer())
 
-        st.success(f"Saved → {dest_path}   (ID: {asset_id}, LOB: {lob_folder})")
+        st.success(f"Saved → {dest_path}   (ID: {asset_id}, LOB: {dest_folder})")
 
         st.session_state.bytes_done += file_size
         st.session_state.files_done += 1
-        st.session_state.log.append({"filename": filename, "asset_id": asset_id, "lob": lob_folder, "status": "SAVED", "bytes": file_size})
+        st.session_state.log.append({"filename": filename, "asset_id": asset_id, "lob": dest_folder, "status": "SAVED", "bytes": file_size})
 
-    # clear ZIPs because output changed
+    # output changed => clear zips
     st.session_state.zip_paths = []
     st.rerun()
 
 st.divider()
 
 # -----------------------------
-# Step 3: Build ZIPs + Download
+# 3) Build ZIPs + Download
 # -----------------------------
-st.subheader("3) Download (ready once uploads are done)")
+st.subheader("3) Download ZIP(s)")
 
-st.write("When you finish uploading, create a ZIP to download the organized folders.")
-
-btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 1])
-
-with btn_col1:
-    build_one_zip = st.button("Build ONE ZIP (matched only)")
-with btn_col2:
-    build_lob_zips = st.button("Build ZIP per LOB (matched only)")
-with btn_col3:
-    build_unmatched_zip = st.button("Build ZIP for Needs_Match")
+st.write("When you finish uploading, build ZIP(s) for matched creatives (and optionally Needs_Match).")
 
 zips_dir = output_root_path / "_zips"
 zips_dir.mkdir(parents=True, exist_ok=True)
+
+c1, c2, c3 = st.columns([1, 1, 1])
+build_one_zip = c1.button("Build ONE ZIP (matched only)")
+build_lob_zips = c2.button("Build ZIP per LOB (matched only)")
+build_unmatched_zip = c3.button(f"Build ZIP for {UNMATCHED_DIR}")
 
 if build_one_zip:
     with st.spinner("Building matched_creatives.zip ..."):
@@ -354,37 +342,33 @@ if build_lob_zips:
     st.success(f"Created {len(st.session_state.zip_paths)} ZIP(s).")
 
 if build_unmatched_zip:
-    with st.spinner("Building needs_match.zip ..."):
-        zip_path = zips_dir / "needs_match.zip"
+    with st.spinner(f"Building {UNMATCHED_DIR}.zip ..."):
+        zip_path = zips_dir / f"{UNMATCHED_DIR}.zip"
         zip_folder(output_root_path / UNMATCHED_DIR, zip_path)
-        # keep any already-created zips + add this
-        existing = [p for p in st.session_state.zip_paths if p.exists()]
+        existing = [p for p in st.session_state.zip_paths if isinstance(p, Path) and p.exists()]
         st.session_state.zip_paths = existing + [zip_path]
-    st.success("ZIP created: needs_match.zip")
+    st.success(f"ZIP created: {UNMATCHED_DIR}.zip")
 
-# Download buttons
 existing_zips = [p for p in st.session_state.zip_paths if isinstance(p, Path) and p.exists()]
 
 if existing_zips:
-    st.markdown("### Download ZIP(s)")
+    st.markdown("### Download")
     for zp in existing_zips:
-        # NOTE: Streamlit download_button requires bytes; for large zips, this will use memory.
-        # This is why "ZIP per LOB" is often safer for big totals.
-        zip_bytes = zp.read_bytes()
+        # For very large zips, prefer "ZIP per LOB" so each download is smaller.
         st.download_button(
             label=f"Download {zp.name} ({human_bytes(zp.stat().st_size)})",
-            data=zip_bytes,
+            data=zp.read_bytes(),
             file_name=zp.name,
             mime="application/zip",
             key=f"dl_{zp.name}",
         )
 else:
-    st.info("No ZIP built yet. Upload files first, then click one of the Build ZIP buttons.")
+    st.info("No ZIP built yet. Upload files first, then click a Build ZIP button.")
 
 st.divider()
 
 # -----------------------------
-# Log + export
+# Log
 # -----------------------------
 st.subheader("Run log")
 log_df = pd.DataFrame(st.session_state.log)
@@ -397,5 +381,3 @@ if not log_df.empty:
         file_name="lob_organizer_log.csv",
         mime="text/csv",
     )
-
-st.caption(f"Unmatched files are saved into output/{UNMATCHED_DIR}/ so you can review them later.")
