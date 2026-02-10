@@ -2,7 +2,7 @@
 # ------------------------------------------------------------
 # LOB Auto Organizer
 # - Upload CSV (sheet export)
-# - Upload image files one-by-one
+# - Upload image files one-by-one (JPEG/PNG/etc allowed)
 # - Extract ID FROM IMAGE FILENAME
 # - Match that ID to ID extracted from the sheet link column
 # - Save into output/<LOB>/<filename> (only allowed LOBs)
@@ -53,7 +53,7 @@ ANY_LONG_NUM_IN_TEXT = re.compile(r"\b(\d{6,})\b")
 
 def extract_id_from_filename(filename: str) -> str | None:
     """
-    Extract ID strictly from filename (your requirement).
+    Extract ID strictly from filename.
     Priority:
       1) GI-########
       2) license_######## or license-########
@@ -117,7 +117,6 @@ def human_bytes(n: float) -> str:
 # -----------------------------
 def read_csv_with_detected_header(uploaded_file) -> pd.DataFrame:
     """
-    Your CSV sometimes has the real header row not at row 0.
     Detect the header row by finding a cell with 'Web Link' (case-insensitive).
     """
     raw = pd.read_csv(uploaded_file, header=None, dtype=str, keep_default_na=False)
@@ -354,8 +353,16 @@ with m4:
 progress = min(st.session_state.bytes_done / total_bytes, 1.0) if total_bytes > 0 else 0.0
 st.progress(progress)
 
+# ✅ Allow JPEG and other image types (fixes "image/jpeg files are not allowed")
 uploaded = st.file_uploader(
     "Upload an image (one at a time)",
+    type=[
+        "jpg", "jpeg", "png", "gif",
+        "webp", "tiff", "bmp",
+        # optional: if you ever upload other creative formats
+        "mp4", "mov", "webm",
+        "zip",
+    ],
     accept_multiple_files=False,
     key="file_uploader",
 )
@@ -374,11 +381,20 @@ if uploaded is not None:
         st.error(f"Could not extract an ID from the filename: {filename}")
         dest_folder = UNMATCHED_DIR
         st.session_state.log.append(
-            {"filename": filename, "asset_id": None, "lob": dest_folder, "status": "NO_ID_IN_FILENAME", "bytes": file_size}
+            {
+                "filename": filename,
+                "asset_id": None,
+                "lob": dest_folder,
+                "status": "NO_ID_IN_FILENAME",
+                "bytes": file_size,
+            }
         )
     else:
         mapped_lob = st.session_state.id_to_lob.get(asset_id, "")
         dest_folder = mapped_lob if mapped_lob in ALLOWED_LOBS else UNMATCHED_DIR
+
+        # quick visual check
+        st.info(f"Detected ID from filename: {asset_id} → Folder: {dest_folder}")
 
         dest_dir = output_root_path / dest_folder
         dest_path = dest_dir / filename
@@ -386,12 +402,18 @@ if uploaded is not None:
         with open(dest_path, "wb") as f:
             f.write(uploaded.getbuffer())
 
-        st.success(f"Saved → {dest_path}   (Filename ID: {asset_id}, LOB: {dest_folder})")
+        st.success(f"Saved → {dest_path}")
 
         st.session_state.bytes_done += file_size
         st.session_state.files_done += 1
         st.session_state.log.append(
-            {"filename": filename, "asset_id": asset_id, "lob": dest_folder, "status": "SAVED", "bytes": file_size}
+            {
+                "filename": filename,
+                "asset_id": asset_id,
+                "lob": dest_folder,
+                "status": "SAVED",
+                "bytes": file_size,
+            }
         )
 
     # output changed => clear any previous zips
