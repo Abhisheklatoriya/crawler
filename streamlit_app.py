@@ -2,7 +2,7 @@
 # ------------------------------------------------------------
 # LOB Auto Organizer
 # - Upload CSV (sheet export)
-# - Upload image files one-by-one (JPEG/PNG/etc allowed)
+# - Upload image files in batches (multiple files at once)
 # - Extract ID FROM IMAGE FILENAME
 # - Match that ID to ID extracted from the sheet link column
 # - Save into output/<LOB>/<filename> (only allowed LOBs)
@@ -162,11 +162,10 @@ def build_id_to_lob_map(df: pd.DataFrame, link_col: str, lob_col: str) -> tuple[
             missing_id_count += 1
             continue
 
-        canonical_lob = normalize_lob(lob_raw) or ""  # empty if not allowed
+        canonical_lob = normalize_lob(lob_raw) or ""
 
         if asset_id in id_to_lob:
             dup_ids[asset_id].append(canonical_lob)
-            # keep first non-empty canonical lob
             if (not id_to_lob[asset_id]) and canonical_lob:
                 id_to_lob[asset_id] = canonical_lob
         else:
@@ -180,10 +179,8 @@ def build_id_to_lob_map(df: pd.DataFrame, link_col: str, lob_col: str) -> tuple[
 # Zipping helpers
 # -----------------------------
 def zip_folder(folder_path: Path, zip_path: Path) -> None:
-    """Zip the contents of folder_path into zip_path."""
     if zip_path.exists():
         zip_path.unlink()
-
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for p in folder_path.rglob("*"):
             if p.is_file():
@@ -191,10 +188,8 @@ def zip_folder(folder_path: Path, zip_path: Path) -> None:
 
 
 def zip_matched_only(output_root: Path, zip_path: Path) -> None:
-    """Create a zip that contains only matched LOB folders (excludes Needs_Match)."""
     if zip_path.exists():
         zip_path.unlink()
-
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for lob in ALLOWED_LOBS:
             lob_dir = output_root / lob
@@ -206,23 +201,18 @@ def zip_matched_only(output_root: Path, zip_path: Path) -> None:
 
 
 def zip_per_lob(output_root: Path, zips_dir: Path) -> list[Path]:
-    """Create one zip per allowed LOB folder. Returns list of zip file paths."""
     zips_dir.mkdir(parents=True, exist_ok=True)
     created = []
-
     for lob in ALLOWED_LOBS:
         lob_dir = output_root / lob
         if not lob_dir.exists():
             continue
-        # Only zip if it has files
         has_file = any(p.is_file() for p in lob_dir.rglob("*"))
         if not has_file:
             continue
-
         zip_path = zips_dir / f"{lob}.zip"
         zip_folder(lob_dir, zip_path)
         created.append(zip_path)
-
     return created
 
 
@@ -230,25 +220,18 @@ def zip_per_lob(output_root: Path, zips_dir: Path) -> list[Path]:
 # Streamlit App
 # -----------------------------
 st.set_page_config(page_title="LOB Auto Organizer", layout="wide")
-st.title("LOB Auto Organizer (Filename-based matching + ZIP downloads)")
-
+st.title("LOB Auto Organizer (Multi-file upload + ZIP downloads)")
 st.caption(f"Allowed LOBs: {', '.join(ALLOWED_LOBS)}")
 
 col1, col2 = st.columns([1, 1])
 with col1:
-    total_gb = st.number_input(
-        "Total size you expect to upload (GB) — used for ETA",
-        min_value=0.0,
-        value=45.0,
-        step=1.0,
-    )
+    total_gb = st.number_input("Total size you expect to upload (GB) — used for ETA", min_value=0.0, value=45.0, step=1.0)
 with col2:
     output_root = st.text_input("Output folder", value="output")
 
 output_root_path = Path(output_root)
 output_root_path.mkdir(parents=True, exist_ok=True)
 
-# Ensure destination folders exist (exactly like your dropdown)
 for lob in ALLOWED_LOBS:
     (output_root_path / lob).mkdir(parents=True, exist_ok=True)
 (output_root_path / UNMATCHED_DIR).mkdir(parents=True, exist_ok=True)
@@ -289,16 +272,8 @@ if csv_file is not None:
     def find_col(name: str) -> int:
         return lower_cols.index(name.lower()) if name.lower() in lower_cols else 0
 
-    link_col = st.selectbox(
-        "Column that contains the link with the ID (usually Web Link)",
-        options=cols,
-        index=find_col("Web Link"),
-    )
-    lob_col = st.selectbox(
-        "Column that contains LOB",
-        options=cols,
-        index=find_col("LOB"),
-    )
+    link_col = st.selectbox("Column that contains the link with the ID (usually Web Link)", options=cols, index=find_col("Web Link"))
+    lob_col = st.selectbox("Column that contains LOB", options=cols, index=find_col("LOB"))
 
     id_to_lob, dup_ids, missing_id_count = build_id_to_lob_map(df, link_col, lob_col)
     st.session_state.id_to_lob = id_to_lob
@@ -314,19 +289,12 @@ if csv_file is not None:
             f"Those uploads will go to {UNMATCHED_DIR}."
         )
 
-    dup_count = sum(1 for _, v in dup_ids.items() if len(set([x for x in v if x])) > 1)
-    if dup_count:
-        st.warning(
-            f"Found {dup_count} ID(s) mapped to multiple LOB values. "
-            f"The app keeps the first non-empty LOB."
-        )
-
 st.divider()
 
 # -----------------------------
-# 2) Upload files one-by-one
+# 2) Upload files in batches
 # -----------------------------
-st.subheader("2) Upload image files one-by-one (matched by FILENAME → LOB)")
+st.subheader("2) Upload image files (multiple at once) — matched by FILENAME → LOB")
 
 if st.session_state.id_to_lob is None:
     st.info("Upload the CSV first so the app knows how to map IDs → LOB.")
@@ -353,72 +321,53 @@ with m4:
 progress = min(st.session_state.bytes_done / total_bytes, 1.0) if total_bytes > 0 else 0.0
 st.progress(progress)
 
-# ✅ Allow JPEG and other image types (fixes "image/jpeg files are not allowed")
-uploaded = st.file_uploader(
-    "Upload an image (one at a time)",
-    type=[
-        "jpg", "jpeg", "png", "gif",
-        "webp", "tiff", "bmp",
-        # optional: if you ever upload other creative formats
-        "mp4", "mov", "webm",
-        "zip",
-    ],
-    accept_multiple_files=False,
-    key="file_uploader",
+uploaded_files = st.file_uploader(
+    "Upload images (select multiple files or a folder)",
+    type=["jpg", "jpeg", "png", "gif", "webp", "tiff", "bmp"],
+    accept_multiple_files=True,
+    key="file_uploader_multi",
 )
 
-if uploaded is not None:
+if uploaded_files:
     if st.session_state.start_time is None:
         st.session_state.start_time = time.time()
 
-    filename = uploaded.name
-    file_size = uploaded.size
+    processed = 0
+    matched = 0
+    for up in uploaded_files:
+        filename = up.name
+        file_size = up.size
 
-    # ✅ Extract ID from the IMAGE FILE NAME (your requirement)
-    asset_id = extract_id_from_filename(filename)
+        asset_id = extract_id_from_filename(filename)
 
-    if not asset_id:
-        st.error(f"Could not extract an ID from the filename: {filename}")
-        dest_folder = UNMATCHED_DIR
-        st.session_state.log.append(
-            {
-                "filename": filename,
-                "asset_id": None,
-                "lob": dest_folder,
-                "status": "NO_ID_IN_FILENAME",
-                "bytes": file_size,
-            }
-        )
-    else:
+        if not asset_id:
+            dest_folder = UNMATCHED_DIR
+            st.session_state.log.append(
+                {"filename": filename, "asset_id": None, "lob": dest_folder, "status": "NO_ID_IN_FILENAME", "bytes": file_size}
+            )
+            continue
+
         mapped_lob = st.session_state.id_to_lob.get(asset_id, "")
         dest_folder = mapped_lob if mapped_lob in ALLOWED_LOBS else UNMATCHED_DIR
-
-        # quick visual check
-        st.info(f"Detected ID from filename: {asset_id} → Folder: {dest_folder}")
+        if dest_folder != UNMATCHED_DIR:
+            matched += 1
 
         dest_dir = output_root_path / dest_folder
         dest_path = dest_dir / filename
 
         with open(dest_path, "wb") as f:
-            f.write(uploaded.getbuffer())
-
-        st.success(f"Saved → {dest_path}")
+            f.write(up.getbuffer())
 
         st.session_state.bytes_done += file_size
         st.session_state.files_done += 1
+        processed += 1
+
         st.session_state.log.append(
-            {
-                "filename": filename,
-                "asset_id": asset_id,
-                "lob": dest_folder,
-                "status": "SAVED",
-                "bytes": file_size,
-            }
+            {"filename": filename, "asset_id": asset_id, "lob": dest_folder, "status": "SAVED", "bytes": file_size}
         )
 
-    # output changed => clear any previous zips
-    st.session_state.zip_paths = []
-    st.rerun()
+    st.session_state.zip_paths = []  # clear zips since output changed
+    st.success(f"Processed {processed} file(s). Matched: {matched}. Unmatched: {processed - matched}.")
 
 st.divider()
 
